@@ -9,15 +9,18 @@ import numpy as np
 
 class ImageData:
 
-    def __init__(self, load_size, channels, augment_flag=False):
+    def __init__(self, load_size, channels, augment_flag=False, do_random_hue=False):
         self.load_size = load_size
         self.channels = channels
         self.augment_flag = augment_flag
+        self.do_random_hue = do_random_hue
 
     def image_processing(self, filename):
         x = tf.read_file(filename)
         x_decode = tf.image.decode_jpeg(x, channels=self.channels)
-        img = tf.image.resize_images(x_decode, [self.load_size, self.load_size])
+        img = tf.image.resize_images(x_decode, upwithskip[self.load_size, self.load_size])
+        if self.do_random_hue:
+            img = tf.image.random_hue(img, 0.5)
         img = tf.cast(img, tf.float32) / 127.5 - 1
 
         if self.augment_flag :
@@ -57,6 +60,9 @@ def inverse_transform(images):
 
 def imsave(images, size, path):
     return misc.imsave(path, merge(images, size))
+
+def save_one_img(image, path):
+    return misc.imsave(path, inverse_transform(image))
 
 def merge(images, size):
     h, w = images.shape[1], images.shape[2]

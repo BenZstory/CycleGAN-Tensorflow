@@ -1,7 +1,10 @@
 import tensorflow as tf
 import tensorflow.contrib as tf_contrib
+import numpy as np
+import vgg19
 
-weight_init = tf.random_normal_initializer(mean=0.0, stddev=0.02)
+weight_init_before = tf.random_normal_initializer(mean=0.0, stddev=0.02)
+weight_init = tf_contrib.layers.xavier_initializer()
 weight_regularizer = None
 
 ##################################################################################
@@ -79,6 +82,10 @@ def tanh(x):
 # Normalization function
 ##################################################################################
 
+def group_norm(x, scope='group_norm'):
+    #https://github.com/tensorflow/tensorflow/blob/r1.12/tensorflow/contrib/layers/python/layers/normalization.py
+    return tf_contrib.layers.group_norm(x)
+
 def instance_norm(x, scope='instance_norm'):
     return tf_contrib.layers.instance_norm(x,
                                            epsilon=1e-05,
@@ -117,7 +124,6 @@ def generator_loss(type, fake):
 
     loss = fake_loss
 
-
     return loss
 
 
@@ -125,3 +131,71 @@ def L1_loss(x, y):
     loss = tf.reduce_mean(tf.abs(x - y))
 
     return loss
+
+
+def get_centre_mask(size):
+    def normfun(x, mu, sigma):
+        pdf = np.exp(-((x - mu) ** 2) / (2 * sigma ** 2)) / (sigma * np.sqrt(2 * np.pi))
+        return pdf
+
+    # IMAGE_SIZE = 20
+    inner_size = int(size / 2)
+    pad_size = int((size - inner_size) / 2)
+    line = np.arange(0, 1, 1 / inner_size)
+    x = normfun(line, 0.5, 0.35)
+    y = normfun(line, 0.5, 0.35)
+
+    z = [xitem * y for xitem in x]
+    z = np.maximum(z, 0)
+    z = np.minimum(z, 1)
+    z = np.pad(z, ((pad_size, size-inner_size-pad_size), (pad_size, size-inner_size-pad_size)), 'constant', constant_values=(0))
+
+    return z
+
+
+def get_centre_mask_tensor(size, batch_size):
+    mask = get_centre_mask(size)
+    mask = np.array(mask)
+    mask = np.reshape(mask, (mask.shape[0], mask.shape[1], 1))
+    mask = np.repeat(mask, 3, axis=2)
+
+    mask_tensor = tf.constant(mask)
+    mask_tensor = tf.tile(mask_tensor, multiples=[batch_size, 1, 1])  # fake.shape[0]
+    mask_tensor = tf.reshape(mask_tensor, [batch_size, mask.shape[0], mask.shape[1], 3])
+    mask_tensor = tf.cast(mask_tensor, dtype=tf.float32)
+    return mask_tensor
+
+
+def semantic_loss_with_attention(real, fake, batch_size):
+    """"""
+    vgg = vgg19.Vgg19('/home/benjamin/Workspace/ml/I19tModel/vgg19.npy')
+
+    vgg.build(real)
+    real_feature_map = vgg.conv3_3_no_activation
+
+    mask_tensor = get_centre_mask_tensor(int(fake.shape[2]), batch_size)
+    print("mask_tensor.shape = ", mask_tensor.shape)
+
+    fake_masked = tf.multiply(mask_tensor, fake) + tf.multiply((1 - mask_tensor), real)
+
+    vgg.build(fake_masked)
+    fake_feature_map = vgg.conv3_3_no_activation
+
+    loss = L1_loss(real_feature_map, fake_feature_map)
+
+    return loss
+
+
+def pix_loss_with_attention(real, fake, batch_size):
+    mask_tensor = get_centre_mask_tensor(int(fake.shape[2]), batch_size)
+    print("mask_tensor.shape = ", str(mask_tensor.get_shape().as_list()))
+    fake_masked = tf.multiply(mask_tensor, fake) + tf.multiply((1 - mask_tensor), real)
+    loss = L1_loss(real, fake_masked)
+    return loss
+
+
+def lsgan_loss_discriminator_counter_penalty(prob_penalty, batch_size):
+    print("prob_penalty.shape=" + str(prob_penalty.get_shape().as_list()))
+    mask_tensor = get_centre_mask_tensor(int(prob_penalty.shape[2]), batch_size)
+    penalty_loss = tf.reduce_mean(tf.squared_difference(prob_penalty * (1-mask_tensor), 0))
+    return penalty_loss

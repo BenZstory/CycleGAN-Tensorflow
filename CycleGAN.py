@@ -2,18 +2,25 @@ from ops import *
 from utils import *
 from glob import glob
 import time
+from datetime import datetime
 from tensorflow.contrib.data import batch_and_drop_remainder
+import tensorflow as tf
 
 class CycleGAN(object) :
     def __init__(self, sess, args):
         self.model_name = 'CycleGAN'
         self.sess = sess
+        self.args_dict = vars(args)
         self.checkpoint_dir = args.checkpoint_dir
         self.result_dir = args.result_dir
         self.log_dir = args.log_dir
         self.sample_dir = args.sample_dir
+        self.from_checkpoint = args.from_checkpoint
         self.dataset_name = args.dataset
         self.augment_flag = args.augment_flag
+        self.do_random_hue = args.do_random_hue
+        self.skip = args.skip
+        self.restore_partly = args.restore_partly
 
         self.epoch = args.epoch
         self.iteration = args.iteration
@@ -21,6 +28,7 @@ class CycleGAN(object) :
 
         self.batch_size = args.batch_size
         self.print_freq = args.print_freq
+        self.print_step = args.print_step
         self.save_freq = args.save_freq
 
         self.img_size = args.img_size
@@ -33,7 +41,11 @@ class CycleGAN(object) :
         self.gan_w = args.gan_w
         self.cycle_w = args.cycle_w
         self.identity_w = args.identity_w
-
+        self.counter_penalty_w = args.counter_penalty_w
+        self.semantic_w = args.semantic_w
+        self.pix_loss_w = args.pix_loss_w
+        self.pix_loss_w_base = self.pix_loss_w
+        self.semantic_w_base = self.semantic_w
 
         """ Generator """
         self.n_res = args.n_res
@@ -41,12 +53,20 @@ class CycleGAN(object) :
         """ Discriminator """
         self.n_dis = args.n_dis
 
+        """ working on dir params """
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.model_dir = "{}_{}_{}_{}".format(self.model_name, self.dataset_name, self.gan_type, current_time)
+
         self.sample_dir = os.path.join(args.sample_dir, self.model_dir)
-        check_folder(self.sample_dir)
+        check_folder(os.path.join(self.sample_dir, "imgs"))
+
+        self.checkpoint_dir = os.path.join(args.checkpoint_dir, self.model_dir)
+        self.log_dir = os.path.join(args.log_dir, self.model_dir)
 
         self.trainA_dataset = glob('./dataset/{}/*.*'.format(self.dataset_name + '/trainA'))
         self.trainB_dataset = glob('./dataset/{}/*.*'.format(self.dataset_name + '/trainB'))
-        self.dataset_num = max(len(self.trainA_dataset), len(self.trainB_dataset))
+        self.trainP_dataset = glob('./dataset/{}/*.*'.format(self.dataset_name + '/trainP'))
+        self.dataset_num = max(len(self.trainA_dataset), len(self.trainB_dataset), len(self.trainP_dataset))
 
         print("##### Information #####")
         print("# gan type : ", self.gan_type)
@@ -102,6 +122,239 @@ class CycleGAN(object) :
 
             return x
 
+    # this is a skip version in which we add conv_block with devconv-IN output
+    def generator_with_skip(self, x, reuse=False, scope="generator"):
+        channel = self.ch
+        with tf.variable_scope(scope, reuse=reuse):
+            input = x
+
+            #  conv_0
+            x = conv(x, channel, kernel=7, stride=1, pad=3, pad_type='reflect', scope='conv_0')
+            x = instance_norm(x, scope='ins_0')
+            e0 = relu(x)
+
+            # down-sample conv_1
+            channel = channel * 2
+            x = conv(e0, channel, kernel=3, stride=2, pad=1, scope='conv_1')
+            x = instance_norm(x, scope='down_ins_1')
+            e1 = relu(x)
+
+            # down-sample conv_2
+            channel = channel * 2
+            x = conv(e1, channel, kernel=3, stride=2, pad=1, scope='conv_2')
+            x = instance_norm(x, scope='down_ins_2')
+            e2 = relu(x)
+
+            # Bottle-neck
+            x = e2
+            for i in range(self.n_res):
+                x = resblock(x, channel, scope='resblock_' + str(i))
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_1')
+            x = instance_norm(x, scope='up_ins_1')
+            x = relu(x+e1)
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_2')
+            x = instance_norm(x, scope='up_ins_2')
+            x = relu(x + e0)
+
+            x = conv(x, channels=3, kernel=7, stride=1, pad=3, pad_type='reflect', scope='G_logit')
+            x = tanh(x + input)
+
+            return x
+
+
+    def generator_with_skip2(self, x, reuse=False, scope="generator"):
+        channel = self.ch
+        with tf.variable_scope(scope, reuse=reuse):
+            input = x
+
+            #  conv_0
+            x = conv(x, channel, kernel=7, stride=1, pad=3, pad_type='reflect', scope='conv_0')
+            x = instance_norm(x, scope='ins_0')
+            e0 = relu(x)
+
+            # down-sample conv_1
+            channel = channel * 2
+            x = conv(e0, channel, kernel=3, stride=2, pad=1, scope='conv_1')
+            x = instance_norm(x, scope='down_ins_1')
+            e1 = relu(x)
+
+            # down-sample conv_2
+            channel = channel * 2
+            x = conv(e1, channel, kernel=3, stride=2, pad=1, scope='conv_2')
+            x = instance_norm(x, scope='down_ins_2')
+            e2 = relu(x)
+
+            # Bottle-neck
+            x = e2
+            for i in range(self.n_res):
+                x = resblock(x, channel, scope='resblock_' + str(i))
+
+            # up-sample deconv_0
+            x = tf.concat([x, e2], axis=-1)
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_1')
+            x = instance_norm(x, scope='up_ins_1')
+            x = relu(x)
+
+            # up-sample deconv_0
+            x = tf.concat([x, e1], axis=-1)
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_2')
+            x = instance_norm(x, scope='up_ins_2')
+            x = relu(x)
+
+        with tf.variable_scope(scope + "_upwithskip", reuse=reuse):
+            x = tf.concat([x, e0], axis=-1)
+            x = conv(x, channels=3, kernel=7, stride=1, pad=3, pad_type='reflect', scope='G_logit')
+            x = tanh(x)
+
+            return x
+
+
+    def generator_with_skip3(self, x, reuse=False, scope="generator"):
+        channel = self.ch
+        with tf.variable_scope(scope, reuse=reuse):
+            input = x
+
+            #  conv_0
+            x = conv(x, channel, kernel=7, stride=1, pad=3, pad_type='reflect', scope='conv_0')
+            x = instance_norm(x, scope='ins_0')
+            e0 = relu(x)
+
+            # down-sample conv_1
+            channel = channel * 2
+            x = conv(e0, channel, kernel=3, stride=2, pad=1, scope='conv_1')
+            x = instance_norm(x, scope='down_ins_1')
+            e1 = relu(x)
+
+            # down-sample conv_2
+            channel = channel * 2
+            x = conv(e1, channel, kernel=3, stride=2, pad=1, scope='conv_2')
+            x = instance_norm(x, scope='down_ins_2')
+            e2 = relu(x)
+
+            # Bottle-neck
+            x = e2
+            for i in range(self.n_res):
+                x = resblock(x, channel, scope='resblock_' + str(i))
+
+        # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_1')
+            x = instance_norm(x, scope='up_ins_1')
+            x = relu(x)
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_2')
+            x = instance_norm(x, scope='up_ins_2')
+            x = relu(x)
+
+        with tf.variable_scope(scope + "_upwithskip3", reuse=reuse):
+            x = tf.concat([x, e0], axis=-1)
+            x = conv(x, channels=3, kernel=7, stride=1, pad=3, pad_type='reflect', scope='G_logit')
+            x = tanh(x)
+
+            return x
+
+
+    def generator_with_skip4(self, x, reuse=False, scope="generator"):
+        channel = self.ch
+        with tf.variable_scope(scope, reuse=reuse):
+            input = x
+
+            #  conv_0
+            x = conv(x, channel, kernel=7, stride=1, pad=3, pad_type='reflect', scope='conv_0')
+            x = instance_norm(x, scope='ins_0')
+            e0 = relu(x)
+
+            # down-sample conv_1
+            channel = channel * 2
+            x = conv(e0, channel, kernel=3, stride=2, pad=1, scope='conv_1')
+            x = instance_norm(x, scope='down_ins_1')
+            e1 = relu(x)
+
+            # down-sample conv_2
+            channel = channel * 2
+            x = conv(e1, channel, kernel=3, stride=2, pad=1, scope='conv_2')
+            x = instance_norm(x, scope='down_ins_2')
+            e2 = relu(x)
+
+            # Bottle-neck
+            x = e2
+            for i in range(self.n_res):
+                x = resblock(x, channel, scope='resblock_' + str(i))
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_1')
+            x = instance_norm(x, scope='up_ins_1')
+            x = relu(x)
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_2')
+            x = instance_norm(x, scope='up_ins_2')
+            x = relu(x)
+
+        with tf.variable_scope(scope + "_upwithskip", reuse=reuse):
+            x = conv(x, channels=3, kernel=7, stride=1, pad=3, pad_type='reflect', scope='G_logit')
+            x = tanh(x + input)
+
+            return x
+
+    def generator_with_skip5(self, x, reuse=False, scope="generator"):
+        channel = self.ch
+        with tf.variable_scope(scope, reuse=reuse):
+            input = x
+
+            #  conv_0
+            x = conv(x, channel, kernel=7, stride=1, pad=3, pad_type='reflect', scope='conv_0')
+            x = instance_norm(x, scope='ins_0')
+            e0 = relu(x)
+
+            # down-sample conv_1
+            channel = channel * 2
+            x = conv(e0, channel, kernel=3, stride=2, pad=1, scope='conv_1')
+            x = instance_norm(x, scope='down_ins_1')
+            e1 = relu(x)
+
+            # down-sample conv_2
+            channel = channel * 2
+            x = conv(e1, channel, kernel=3, stride=2, pad=1, scope='conv_2')
+            x = instance_norm(x, scope='down_ins_2')
+            e2 = relu(x)
+
+            # Bottle-neck
+            x = e2
+            for i in range(self.n_res):
+                x = resblock(x, channel, scope='resblock_' + str(i))
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_1')
+            x = instance_norm(x, scope='up_ins_1')
+            x = relu(x)
+
+            # up-sample deconv_0
+            channel = channel // 2
+            x = deconv(x, channel, kernel=3, stride=2, scope='deconv_2')
+            x = instance_norm(x, scope='up_ins_2')
+            x = relu(x)
+
+        with tf.variable_scope(scope + "_upwithskip5", reuse=reuse):
+            x = tf.concat([x, input], axis=-1)
+            x = conv(x, channels=3, kernel=7, stride=1, pad=3, pad_type='reflect', scope='G_logit')
+            x = tanh(x)
+
+            return x
+
     ##################################################################################
     # Discriminator
     ##################################################################################
@@ -132,12 +385,34 @@ class CycleGAN(object) :
     ##################################################################################
 
     def generate_a2b(self, x_A, reuse=False):
-        x_ab = self.generator(x_A, reuse=reuse, scope='generator_B')
+        if (self.skip == 1):
+            x_ab = self.generator_with_skip(x_A, reuse=reuse, scope='generator_B')
+        elif (self.skip == 2):
+            x_ab = self.generator_with_skip2(x_A, reuse=reuse, scope='generator_B')
+        elif (self.skip == 3):
+            x_ab = self.generator_with_skip3(x_A, reuse=reuse, scope='generator_B')
+        elif (self.skip == 4):
+            x_ab = self.generator_with_skip4(x_A, reuse=reuse, scope='generator_B')
+        elif self.skip == 5:
+            x_ab = self.generator_with_skip5(x_A, reuse=reuse, scope='generator_B')
+        else:
+            x_ab = self.generator(x_A, reuse=reuse, scope='generator_B')
 
         return x_ab
 
     def generate_b2a(self, x_B, reuse=False):
-        x_ba = self.generator(x_B, reuse=reuse, scope='generator_A')
+        if (self.skip == 1):
+            x_ba = self.generator_with_skip(x_B, reuse=reuse, scope='generator_A')
+        elif (self.skip == 2):
+            x_ba = self.generator_with_skip2(x_B, reuse=reuse, scope='generator_A')
+        elif (self.skip == 3):
+            x_ba = self.generator_with_skip3(x_B, reuse=reuse, scope='generator_A')
+        elif (self.skip == 4):
+            x_ba = self.generator_with_skip4(x_B, reuse=reuse, scope='generator_A')
+        elif (self.skip == 5):
+            x_ba = self.generator_with_skip5(x_B, reuse=reuse, scope='generator_A')
+        else:
+            x_ba = self.generator(x_B, reuse=reuse, scope='generator_A')
 
         return x_ba
 
@@ -157,20 +432,33 @@ class CycleGAN(object) :
         self.lr = tf.placeholder(tf.float32, name='learning_rate')
 
         """ Input Image"""
-        Image_Data_Class = ImageData(self.img_size, self.img_ch, self.augment_flag)
+        Image_Data_Class = ImageData(self.img_size, self.img_ch, self.augment_flag, self.do_random_hue)
+        # Image_Data_Class_B = ImageData(self.img_size, self.img_ch, self.augment_flag, self.do_random_hue)
 
         trainA = tf.data.Dataset.from_tensor_slices(self.trainA_dataset)
         trainB = tf.data.Dataset.from_tensor_slices(self.trainB_dataset)
+        trainP = tf.data.Dataset.from_tensor_slices(self.trainP_dataset)
 
-        trainA = trainA.prefetch(self.batch_size).shuffle(self.dataset_num).map(Image_Data_Class.image_processing, num_parallel_calls=8).apply(batch_and_drop_remainder(self.batch_size)).repeat()
-        trainB = trainB.prefetch(self.batch_size).shuffle(self.dataset_num).map(Image_Data_Class.image_processing, num_parallel_calls=8).apply(batch_and_drop_remainder(self.batch_size)).repeat()
+        # trainA = trainA.prefetch(self.batch_size).shuffle(self.dataset_num).map(Image_Data_Class.image_processing, num_parallel_calls=8).apply(batch_and_drop_remainder(self.batch_size)).repeat()
+        # trainB = trainB.prefetch(self.batch_size).shuffle(self.dataset_num).map(Image_Data_Class.image_processing, num_parallel_calls=8).apply(batch_and_drop_remainder(self.batch_size)).repeat()
+        # trainP = trainP.prefetch(self.batch_size).shuffle(self.dataset_num).map(Image_Data_Class.image_processing, num_parallel_calls=8).apply(batch_and_drop_remainder(self.batch_size)).repeat()
+
+        trainA = trainA.shuffle(self.dataset_num, reshuffle_each_iteration=True).repeat()
+        trainA = trainA.map(Image_Data_Class.image_processing).batch(self.batch_size)
+        trainB = trainB.shuffle(self.dataset_num, reshuffle_each_iteration=True).repeat()
+        trainB = trainB.map(Image_Data_Class.image_processing).batch(self.batch_size)
+        trainP = trainP.shuffle(self.dataset_num, reshuffle_each_iteration=True).repeat()
+        trainP = trainP.map(Image_Data_Class.image_processing).batch(self.batch_size)
+
 
         trainA_iterator = trainA.make_one_shot_iterator()
         trainB_iterator = trainB.make_one_shot_iterator()
+        trainP_iterator = trainP.make_one_shot_iterator()
 
 
         self.domain_A = trainA_iterator.get_next()
         self.domain_B = trainB_iterator.get_next()
+        self.domain_P = trainP_iterator.get_next()
 
 
         """ Define Encoder, Generator, Discriminator """
@@ -191,7 +479,6 @@ class CycleGAN(object) :
             identity_loss_a = 0
             identity_loss_b = 0
 
-
         real_A_logit, real_B_logit = self.discriminate_real(self.domain_A, self.domain_B)
         fake_A_logit, fake_B_logit = self.discriminate_fake(x_ba, x_ab)
 
@@ -199,22 +486,48 @@ class CycleGAN(object) :
         G_ad_loss_a = generator_loss(self.gan_type, fake_A_logit)
         G_ad_loss_b = generator_loss(self.gan_type, fake_B_logit)
 
+        if self.semantic_w > 0:
+            semantic_loss_a = semantic_loss_with_attention(self.domain_A, x_ab, self.batch_size)
+            semantic_loss_b = semantic_loss_with_attention(self.domain_B, x_ba, self.batch_size)
+        else:
+            semantic_loss_a = 0
+            semantic_loss_b = 0
+
+        if self.pix_loss_w > 0:
+            pix_loss_a = pix_loss_with_attention(self.domain_A, x_ab, self.batch_size)
+            pix_loss_b = pix_loss_with_attention(self.domain_B, x_ba, self.batch_size)
+        else:
+            pix_loss_a = 0
+            pix_loss_b = 0
+
         D_ad_loss_a = discriminator_loss(self.gan_type, real_A_logit, fake_A_logit)
         D_ad_loss_b = discriminator_loss(self.gan_type, real_B_logit, fake_B_logit)
+
+        # we are only doing counter penalty on a2b, (penalty in domainB)
+        if self.counter_penalty_w > 0:
+            cp_logit = self.discriminator(self.domain_P, reuse=True, scope="discriminator_B")
+            cp_loss = lsgan_loss_discriminator_counter_penalty(cp_logit, self.batch_size)
+        else:
+            cp_loss = 0
 
         recon_loss_a = L1_loss(x_aba, self.domain_A) # reconstruction
         recon_loss_b = L1_loss(x_bab, self.domain_B) # reconstruction
 
         Generator_A_loss = self.gan_w * G_ad_loss_a + \
                            self.cycle_w * recon_loss_b + \
-                           self.identity_w * identity_loss_a
+                           self.identity_w * identity_loss_a + \
+                           self.semantic_w * semantic_loss_a + \
+                           self.pix_loss_w * pix_loss_a
 
         Generator_B_loss = self.gan_w * G_ad_loss_b + \
                            self.cycle_w * recon_loss_a + \
-                           self.identity_w * identity_loss_b
+                           self.identity_w * identity_loss_b + \
+                           self.semantic_w * semantic_loss_b + \
+                           self.pix_loss_w * pix_loss_b
 
         Discriminator_A_loss = self.gan_w * D_ad_loss_a
-        Discriminator_B_loss = self.gan_w * D_ad_loss_b
+        Discriminator_B_loss = self.gan_w * D_ad_loss_b + \
+                               self.counter_penalty_w * cp_loss
 
         self.Generator_loss = Generator_A_loss + Generator_B_loss
         self.Discriminator_loss = Discriminator_A_loss + Discriminator_B_loss
@@ -235,8 +548,16 @@ class CycleGAN(object) :
         self.D_A_loss = tf.summary.scalar("D_A_loss", Discriminator_A_loss)
         self.D_B_loss = tf.summary.scalar("D_B_loss", Discriminator_B_loss)
 
-        self.G_loss = tf.summary.merge([self.G_A_loss, self.G_B_loss, self.all_G_loss])
-        self.D_loss = tf.summary.merge([self.D_A_loss, self.D_B_loss, self.all_D_loss])
+        self.cp_loss_summ = tf.summary.scalar("CP_loss", cp_loss)
+        self.semantic_loss_a_summ = tf.summary.scalar("semantic_A_loss", semantic_loss_a)
+        self.semantic_loss_b_summ = tf.summary.scalar("semantic_B_loss", semantic_loss_a)
+        self.pix_loss_a_summ = tf.summary.scalar("pix_A_loss", pix_loss_a)
+        self.pix_loss_b_summ = tf.summary.scalar("pix_B_loss", pix_loss_b)
+
+        self.G_loss_summ = tf.summary.merge([self.G_A_loss, self.G_B_loss, self.all_G_loss,
+                                             self.semantic_loss_a_summ, self.semantic_loss_b_summ, self.pix_loss_a_summ, self.pix_loss_b_summ])
+        self.D_loss_summ = tf.summary.merge([self.D_A_loss, self.D_B_loss, self.all_D_loss,
+                                             self.cp_loss_summ])
 
         """ Image """
         self.fake_A = x_ba
@@ -245,6 +566,9 @@ class CycleGAN(object) :
         self.real_A = self.domain_A
         self.real_B = self.domain_B
 
+        self.cycle_A = x_aba
+        self.cycle_B = x_bab
+
         """ Test """
         self.test_image = tf.placeholder(tf.float32, [1, self.img_size, self.img_size, self.img_ch], name='test_image')
 
@@ -252,17 +576,27 @@ class CycleGAN(object) :
         self.test_fake_B = self.generate_a2b(self.test_image, reuse=True)
 
     def train(self):
+        self.total_sample_path = os.path.join(os.path.join(self.sample_dir, "_total_samples.html"))
+        self.write_args_to_html()
+
         # initialize all variables
         tf.global_variables_initializer().run()
 
-        # saver to save model
-        self.saver = tf.train.Saver()
+        if self.restore_partly:
+            # saver to save model
+            variables_to_restore = [var for var in tf.global_variables() if 'upwithskip' not in var.name]
+            print("[BENZ] partly restore variables, variables_to_restore:")
+            print(variables_to_restore)
+            self.saver = tf.train.Saver(variables_to_restore)
+            # remind don't forget to reconstruct Saver with full variables, or these skipped vars would never be saved.
+        else:
+            self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.5)
 
         # summary writer
-        self.writer = tf.summary.FileWriter(self.log_dir + '/' + self.model_dir, self.sess.graph)
+        self.writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
 
         # restore check-point if it exits
-        could_load, checkpoint_counter = self.load(self.checkpoint_dir)
+        could_load, checkpoint_counter = self.load(self.from_checkpoint)
         if could_load:
             start_epoch = (int)(checkpoint_counter / self.iteration)
             start_batch_id = checkpoint_counter - start_epoch * self.iteration
@@ -273,6 +607,11 @@ class CycleGAN(object) :
             start_batch_id = 0
             counter = 1
             print(" [!] Load failed...")
+
+        if self.restore_partly:
+            print("recostruct fully graph saver")
+            # reconstruct the saver with full vars
+            self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.5)
 
         # loop for epoch
         start_time = time.time()
@@ -287,11 +626,26 @@ class CycleGAN(object) :
                 }
 
                 # Update D
-                _, d_loss, summary_str = self.sess.run([self.D_optim, self.Discriminator_loss, self.D_loss], feed_dict = train_feed_dict)
+                _, \
+                d_loss, \
+                summary_str = self.sess.run([self.D_optim,
+                                             self.Discriminator_loss,
+                                             self.D_loss_summ], feed_dict = train_feed_dict)
                 self.writer.add_summary(summary_str, counter)
 
                 # Update G
-                batch_A_images, batch_B_images, fake_A, fake_B, _, g_loss, summary_str = self.sess.run([self.real_A, self.real_B, self.fake_A, self.fake_B, self.G_optim, self.Generator_loss, self.G_loss], feed_dict = train_feed_dict)
+                batch_A_images, batch_B_images,\
+                fake_A, fake_B,\
+                cycle_A, cycle_B, \
+                _, \
+                g_loss, \
+                summary_str = \
+                    self.sess.run([self.real_A, self.real_B,
+                                   self.fake_A, self.fake_B,
+                                   self.cycle_A, self.cycle_B,
+                                   self.G_optim,
+                                   self.Generator_loss,
+                                   self.G_loss_summ], feed_dict = train_feed_dict)
                 self.writer.add_summary(summary_str, counter)
 
                 # display training status
@@ -299,19 +653,39 @@ class CycleGAN(object) :
                 print("Epoch: [%2d] [%6d/%6d] time: %4.4f d_loss: %.8f, g_loss: %.8f" \
                       % (epoch, idx, self.iteration, time.time() - start_time, d_loss, g_loss))
 
-                if np.mod(idx+1, self.print_freq) == 0 :
-                    save_images(batch_A_images, [self.batch_size, 1],
-                                './{}/real_A_{:02d}_{:06d}.jpg'.format(self.sample_dir, epoch, idx+1))
-                    # save_images(batch_B_images, [self.batch_size, 1],
-                    #             './{}/real_B_{}_{:02d}_{:06d}.jpg'.format(self.sample_dir, gpu_id, epoch, idx+1))
+                if np.mod(counter+self.print_step, self.print_freq) < self.print_step :
+                    image_save_epoch = (counter + self.print_step) // self.print_freq
+                    step_mod = np.mod(counter+self.print_step, self.print_freq)
+                    html_name = "samples_" + str((counter + self.print_step) // self.print_freq) + '.html'
+                    if np.mod(counter+self.print_step, self.print_freq) == 0:
+                        with open(self.total_sample_path, 'a') as t_html:
+                            t_html.write("<hr style=\"border-bottom: 3px solid red\" />\r\n<h3> Samples_of_" +
+                                         str((counter + self.print_step) // self.print_freq) + " </h3>")
 
-                    # save_images(fake_A, [self.batch_size, 1],
-                    #             './{}/fake_A_{}_{:02d}_{:06d}.jpg'.format(self.sample_dir, gpu_id, epoch, idx+1))
-                    save_images(fake_B, [self.batch_size, 1],
-                                './{}/fake_B_{:02d}_{:06d}.jpg'.format(self.sample_dir, epoch, idx+1))
+                    for j in range(0, self.batch_size):
+                        img_id = step_mod * self.batch_size + j
+
+                        save_one_img(batch_A_images[j], './{}/imgs/real_A_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+                        save_one_img(batch_B_images[j], './{}/imgs/real_B_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+
+                        save_one_img(fake_A[j], './{}/imgs/fake_A_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+                        save_one_img(fake_B[j], './{}/imgs/fake_B_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+
+                        save_one_img(cycle_A[j], './{}/imgs/cycle_A_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+                        save_one_img(cycle_B[j], './{}/imgs/cycle_B_{:02d}_{:06d}_{:02d}.jpg'.format(
+                            self.sample_dir, epoch, idx + 1, img_id))
+
+                        self.write_to_html(os.path.join(self.sample_dir, html_name), epoch, idx + 1, img_id)
 
                 if np.mod(idx+1, self.save_freq) == 0 :
                     self.save(self.checkpoint_dir, counter)
+                    self.pix_loss_w = self.pix_loss_w_base + min(counter/200000, 15-self.pix_loss_w_base)
+                    self.semantic_w = self.semantic_w_base + min(counter/100000 * 0.0001, 0.0006-self.semantic_w_base)
 
             # After an epoch, start_batch_id is set to zero
             # non-zero value is only for the first epoch after loading pre-trained model
@@ -320,13 +694,30 @@ class CycleGAN(object) :
             # save model for final step
             self.save(self.checkpoint_dir, counter)
 
-    @property
-    def model_dir(self):
-        return "{}_{}_{}".format(self.model_name, self.dataset_name, self.gan_type)
+    def write_args_to_html(self):
+        body = ""
+        for k, v in self.args_dict.items():
+            body = body + "--" + str(k) + " " + str(v) + " \\<br>"
+        with open(self.total_sample_path, 'a') as t_html:
+            t_html.write("python3 main.py \\<br>")
+            t_html.write(body)
+
+
+    def write_to_html(self, html_path, epoch, idx, img_id):
+        names = ['real_A', 'real_B', 'fake_B', 'fake_A', 'cycle_A', 'cycle_B']
+
+        body = ""
+        for name in names:
+            image_name = '{}_{:02d}_{:06d}_{:02d}.jpg'.format(name, epoch, idx, img_id)
+            body = body + str("<img src=\"" + os.path.join('imgs', image_name) + "\">")
+        body = body + str("<br>")
+
+        with open(html_path, 'a') as v_html:
+            v_html.write(body)
+        with open(self.total_sample_path, 'a') as t_html:
+            t_html.write(body)
 
     def save(self, checkpoint_dir, step):
-        checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
-
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
 
@@ -335,7 +726,6 @@ class CycleGAN(object) :
     def load(self, checkpoint_dir):
         import re
         print(" [*] Reading checkpoints...")
-        checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
 
         ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
         if ckpt and ckpt.model_checkpoint_path:
@@ -354,7 +744,7 @@ class CycleGAN(object) :
         test_B_files = glob('./dataset/{}/*.*'.format(self.dataset_name + '/testB'))
 
         self.saver = tf.train.Saver()
-        could_load, checkpoint_counter = self.load(self.checkpoint_dir)
+        could_load, checkpoint_counter = self.load(self.from_checkpoint)
         self.result_dir = os.path.join(self.result_dir, self.model_dir)
         check_folder(self.result_dir)
 
